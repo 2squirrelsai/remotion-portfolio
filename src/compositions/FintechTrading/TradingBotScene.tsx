@@ -1,6 +1,7 @@
 import React from 'react';
 import {
   AbsoluteFill,
+  Easing,
   Sequence,
   interpolate,
   spring,
@@ -26,9 +27,10 @@ const priceData = [
 ];
 
 const trades = [
-  { time: 2, action: 'BUY' as const, price: 0.52 },
+  { time: 3, action: 'BUY' as const, price: 0.49 },
   { time: 5, action: 'SELL' as const, price: 0.62 },
   { time: 8, action: 'BUY' as const, price: 0.61 },
+  { time: 10, action: 'SELL' as const, price: 0.72 },
 ];
 
 // Chart dimensions — larger
@@ -40,70 +42,117 @@ const CHART_H = 460;
 const toX = (t: number) => CHART_X + (t / 11) * CHART_W;
 const toY = (p: number) => CHART_Y + CHART_H - ((p - 0.4) / 0.4) * CHART_H;
 
+// Build a smooth cubic bezier spline through all data points (Catmull-Rom -> cubic bezier)
+const buildSmoothPath = (data: typeof priceData, tension = 0.3): string => {
+  if (data.length < 2) return '';
+  const pts = data.map((d) => ({ x: toX(d.t), y: toY(d.p) }));
+
+  let d = `M ${pts[0].x} ${pts[0].y}`;
+  for (let i = 0; i < pts.length - 1; i++) {
+    const p0 = pts[Math.max(0, i - 1)];
+    const p1 = pts[i];
+    const p2 = pts[i + 1];
+    const p3 = pts[Math.min(pts.length - 1, i + 2)];
+
+    const cp1x = p1.x + (p2.x - p0.x) * tension;
+    const cp1y = p1.y + (p2.y - p0.y) * tension;
+    const cp2x = p2.x - (p3.x - p1.x) * tension;
+    const cp2y = p2.y - (p3.y - p1.y) * tension;
+
+    d += ` C ${cp1x} ${cp1y}, ${cp2x} ${cp2y}, ${p2.x} ${p2.y}`;
+  }
+  return d;
+};
+
+// Build area path that closes under the smooth line
+const buildSmoothAreaPath = (data: typeof priceData, tension = 0.3): string => {
+  const linePart = buildSmoothPath(data, tension);
+  if (!linePart) return '';
+  const lastPt = { x: toX(data[data.length - 1].t), y: CHART_Y + CHART_H };
+  const firstPt = { x: toX(data[0].t), y: CHART_Y + CHART_H };
+  return `${linePart} L ${lastPt.x} ${lastPt.y} L ${firstPt.x} ${firstPt.y} Z`;
+};
+
+// Pre-compute full paths (static data, no need to recalculate per frame)
+const fullLinePath = buildSmoothPath(priceData);
+const fullAreaPath = buildSmoothAreaPath(priceData);
+
+// Get the interpolated price value at a fractional t-value using the same
+// Catmull-Rom spline used for rendering, so the displayed price matches the dot.
+const getPriceAtT = (tValue: number): number => {
+  const segIdx = Math.min(Math.floor(tValue), priceData.length - 2);
+  const segFrac = tValue - segIdx;
+  const tension = 0.3;
+
+  const p0 = priceData[Math.max(0, segIdx - 1)].p;
+  const p1 = priceData[segIdx].p;
+  const p2 = priceData[Math.min(priceData.length - 1, segIdx + 1)].p;
+  const p3 = priceData[Math.min(priceData.length - 1, segIdx + 2)].p;
+
+  const cp1 = p1 + (p2 - p0) * tension;
+  const cp2 = p2 - (p3 - p1) * tension;
+
+  const t = segFrac;
+  const mt = 1 - t;
+  return mt * mt * mt * p1 + 3 * mt * mt * t * cp1 + 3 * mt * t * t * cp2 + t * t * t * p2;
+};
+
+// Sample the smooth curve y-value at a given x by evaluating the Catmull-Rom spline
+// This ensures the dot sits exactly on the curve at the clip boundary
+const sampleCurveAtT = (tValue: number): { x: number; y: number } => {
+  const x = toX(tValue);
+  // Find which segment this t falls into
+  const segIdx = Math.min(Math.floor(tValue), priceData.length - 2);
+  const segFrac = tValue - segIdx;
+
+  // Recreate the cubic bezier control points for this segment (same as buildSmoothPath)
+  const tension = 0.3;
+  const pts = priceData.map((d) => ({ x: toX(d.t), y: toY(d.p) }));
+  const i = segIdx;
+  const p0 = pts[Math.max(0, i - 1)];
+  const p1 = pts[i];
+  const p2 = pts[Math.min(pts.length - 1, i + 1)];
+  const p3 = pts[Math.min(pts.length - 1, i + 2)];
+
+  const cp1y = p1.y + (p2.y - p0.y) * tension;
+  const cp2y = p2.y - (p3.y - p1.y) * tension;
+
+  // Evaluate cubic bezier at parameter t using De Casteljau
+  // First find the bezier parameter that corresponds to our x position
+  // Since x is monotonically increasing, we can use the segment fraction directly
+  const t = segFrac;
+  const mt = 1 - t;
+  const y =
+    mt * mt * mt * p1.y +
+    3 * mt * mt * t * cp1y +
+    3 * mt * t * t * cp2y +
+    t * t * t * p2.y;
+
+  return { x, y };
+};
+
 const PriceChart: React.FC<{ frame: number }> = ({ frame }) => {
+  // Smooth eased progress for the line draw
   const chartProgress = interpolate(frame, [0, 120], [0, 1], {
+    extrapolateLeft: 'clamp',
     extrapolateRight: 'clamp',
+    easing: Easing.inOut(Easing.quad),
   });
 
-  const visibleCount = Math.floor(priceData.length * chartProgress);
-  const visibleData = priceData.slice(0, visibleCount);
+  // Clip width drives both line and area reveal — single source of truth
+  const clipWidth = (CHART_W + 10) * chartProgress;
 
-  // Fractional progress for leading edge position
-  const exactProgress = priceData.length * chartProgress;
-  const leadingIdx = Math.min(Math.floor(exactProgress), priceData.length - 2);
-  const leadingFrac = exactProgress - leadingIdx;
+  // Leading edge: fractional t-value (0..11) based on clip x-position
+  const leadingT = chartProgress * 11;
+  // Clamp to valid range for sampling
+  const clampedT = Math.min(leadingT, priceData.length - 1);
+  const leadPos = sampleCurveAtT(clampedT);
 
-  // Leading edge coordinates (interpolated between data points)
-  const leadX = leadingIdx < priceData.length - 1
-    ? toX(priceData[leadingIdx].t) + (toX(priceData[leadingIdx + 1].t) - toX(priceData[leadingIdx].t)) * leadingFrac
-    : toX(priceData[leadingIdx].t);
-  const leadP = leadingIdx < priceData.length - 1
-    ? priceData[leadingIdx].p + (priceData[leadingIdx + 1].p - priceData[leadingIdx].p) * leadingFrac
-    : priceData[leadingIdx].p;
-  const leadY = toY(leadP);
-
-  // Determine if line is going up or down at leading edge
-  const isGoingUp = leadingIdx < priceData.length - 1
-    ? priceData[leadingIdx + 1].p > priceData[leadingIdx].p
-    : false;
-
-  // Build SVG path
-  const linePath = visibleData
-    .map((d, i) => `${i === 0 ? 'M' : 'L'} ${toX(d.t)} ${toY(d.p)}`)
-    .join(' ');
-
-  // Area path (fill under line)
-  const areaPath = visibleData.length > 1
-    ? `${linePath} L ${toX(visibleData[visibleData.length - 1].t)} ${CHART_Y + CHART_H} L ${toX(visibleData[0].t)} ${CHART_Y + CHART_H} Z`
-    : '';
+  // Determine which trade markers are visible based on continuous progress
+  const visibleT = leadingT;
 
   // Grid lines
   const gridYValues = [0.45, 0.5, 0.55, 0.6, 0.65, 0.7];
-
-  // Animated $ signs ahead of the leading edge
-  const dollarSigns = chartProgress > 0.05
-    ? [0, 1, 2].map((i) => {
-        const offsetX = 30 + i * 28;
-        const offsetY = isGoingUp ? -(15 + i * 22) : (15 + i * 22);
-        const signColor = isGoingUp ? fintechColors.positive : fintechColors.negative;
-        // Float animation
-        const floatY = Math.sin(frame * 0.15 + i * 1.5) * 6;
-        const opacity = interpolate(
-          chartProgress,
-          [0.05, 0.15],
-          [0, 0.9 - i * 0.2],
-          { extrapolateLeft: 'clamp', extrapolateRight: 'clamp' }
-        );
-
-        return {
-          x: leadX + offsetX,
-          y: leadY + offsetY + floatY,
-          color: signColor,
-          opacity,
-          size: 18 - i * 3,
-        };
-      })
-    : [];
 
   return (
     <svg width="1200" height="560" viewBox="0 0 1200 560">
@@ -112,6 +161,15 @@ const PriceChart: React.FC<{ frame: number }> = ({ frame }) => {
           <stop offset="0%" stopColor={fintechColors.primary} stopOpacity="0.3" />
           <stop offset="100%" stopColor={fintechColors.primary} stopOpacity="0" />
         </linearGradient>
+        {/* Single clip rect used for both line and area — keeps dot in sync */}
+        <clipPath id="chartRevealClip">
+          <rect
+            x={CHART_X}
+            y={0}
+            width={clipWidth}
+            height={CHART_H + CHART_Y + 20}
+          />
+        </clipPath>
       </defs>
 
       {/* Grid */}
@@ -138,45 +196,33 @@ const PriceChart: React.FC<{ frame: number }> = ({ frame }) => {
         </g>
       ))}
 
-      {/* Area fill */}
-      {visibleData.length > 1 && (
-        <path d={areaPath} fill="url(#chartAreaGradient)" />
+      {/* Area fill — clipped to revealed portion */}
+      {chartProgress > 0 && (
+        <path
+          d={fullAreaPath}
+          fill="url(#chartAreaGradient)"
+          clipPath="url(#chartRevealClip)"
+        />
       )}
 
-      {/* Price line */}
-      {visibleData.length > 1 && (
+      {/* Smooth price line — clipped to same rect as area */}
+      {chartProgress > 0 && (
         <path
-          d={linePath}
+          d={fullLinePath}
           fill="none"
           stroke={fintechColors.chart.line}
           strokeWidth="3"
           strokeLinecap="round"
           strokeLinejoin="round"
+          clipPath="url(#chartRevealClip)"
         />
       )}
 
-      {/* Animated $ signs ahead of leading edge */}
-      {dollarSigns.map((ds, i) => (
-        <text
-          key={`dollar-${i}`}
-          x={ds.x}
-          y={ds.y}
-          textAnchor="middle"
-          fill={ds.color}
-          fontSize={ds.size}
-          fontWeight="700"
-          fontFamily={fintechTypography.numbers.fontFamily}
-          opacity={ds.opacity}
-        >
-          $
-        </text>
-      ))}
-
-      {/* Current price dot */}
-      {visibleData.length > 0 && (
+      {/* Current price dot — positioned on the curve at the clip boundary */}
+      {chartProgress > 0.01 && (
         <circle
-          cx={toX(visibleData[visibleData.length - 1].t)}
-          cy={toY(visibleData[visibleData.length - 1].p)}
+          cx={leadPos.x}
+          cy={leadPos.y}
           r="7"
           fill={fintechColors.primary}
           filter="drop-shadow(0 0 8px rgba(0,212,170,0.6))"
@@ -185,13 +231,14 @@ const PriceChart: React.FC<{ frame: number }> = ({ frame }) => {
 
       {/* Trade markers */}
       {trades.map((trade, i) => {
-        const tradeDelay = 60 + i * 40;
+        const tradeDelay = 60 + i * 30;
         const markerOpacity = interpolate(frame, [tradeDelay, tradeDelay + 15], [0, 1], {
           extrapolateLeft: 'clamp',
           extrapolateRight: 'clamp',
         });
 
-        if (trade.time > visibleCount - 1) return null;
+        // Only show marker once the line has reached this point
+        if (trade.time > visibleT + 0.5) return null;
 
         const isBuy = trade.action === 'BUY';
         const markerColor = isBuy ? fintechColors.positive : fintechColors.negative;
@@ -933,6 +980,15 @@ export const TradingBotScene: React.FC = () => {
     extrapolateRight: 'clamp',
   });
 
+  // Compute live price matching the dot position on the chart
+  const chartProgress = interpolate(frame, [0, 120], [0, 1], {
+    extrapolateLeft: 'clamp',
+    extrapolateRight: 'clamp',
+    easing: Easing.inOut(Easing.quad),
+  });
+  const leadingT = Math.min(chartProgress * 11, priceData.length - 1);
+  const currentPrice = getPriceAtT(leadingT);
+
   return (
     <AbsoluteFill style={{ backgroundColor: fintechColors.background, padding: 50 }}>
       {/* Header */}
@@ -961,7 +1017,7 @@ export const TradingBotScene: React.FC = () => {
               Current Price
             </p>
             <p style={{ ...fintechTypography.numbers, fontSize: 42, color: fintechColors.positive, margin: 0 }}>
-              $0.72
+              ${currentPrice.toFixed(2)}
             </p>
             {/* Guardrails Shield Badge — appears after frame 160 */}
             <Sequence from={160} durationInFrames={80}>
@@ -1004,10 +1060,10 @@ export const TradingBotScene: React.FC = () => {
         </Sequence>
       </div>
 
-      {/* Alert Ticker Strip — appears at frame 100 */}
-      <Sequence from={100} durationInFrames={140}>
+      {/* Alert Ticker Strip — visible immediately */}
+      <Sequence from={0} durationInFrames={240}>
         <div style={{ marginTop: 10 }}>
-          <AlertTicker frame={frame - 100} />
+          <AlertTicker frame={frame} />
         </div>
       </Sequence>
 
